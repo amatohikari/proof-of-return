@@ -9,7 +9,7 @@
 // The entire monetary policy is one formula: balance × (1 - r)^t
 // Everything else is plumbing.
 //
-// AMATO HIKARI — March 2026
+// AMATO HIKARI — April 2026
 // ============================================================================
 
 pragma solidity ^0.8.20;
@@ -19,7 +19,7 @@ pragma solidity ^0.8.20;
 // ============================================================================
 //
 // All exponential calculations live here.
-// Amortization decay, Base recovery, and Creation spending
+// Amortization decay, Base recovery, and Torch recovery
 // all share this foundation.
 
 library DecayMath {
@@ -40,7 +40,7 @@ library DecayMath {
     // Precomputed to WAD precision
     uint256 constant DECAY_PER_SECOND = 999999632559212419; // ≈ 1 - 3.674e-7
 
-    // Base recovery: 6% per day → per-second factor
+    // Base/Torch recovery: 6% per day → per-second factor
     // (1 - 0.06)^(1/86400) = 0.94^(1/86400)
     // Precomputed to WAD precision
     uint256 constant RECOVERY_PER_SECOND = 999999284568437644; // ≈ 1 - 7.154e-7
@@ -127,8 +127,9 @@ library DecayMath {
         return factor;
     }
 
-    /// @notice Calculate Base recovery over elapsed time (per-second precision)
+    /// @notice Calculate recovery over elapsed time (per-second precision)
     /// @dev newBalance = cap - (cap - balance) × recoveryFactor(elapsed)
+    ///      Used by both BaseWallet and TorchWallet.
     ///      Continuous recovery mirrors continuous decay.
     ///      No more day-level truncation — 23 hours 59 minutes of recovery
     ///      is correctly calculated, not rounded to zero.
@@ -193,7 +194,7 @@ contract AmortizationWallet {
         wallets[owner].lastUpdateTime = block.timestamp;
     }
 
-    /// @notice Receive Amortization from a Base/Creation payment
+    /// @notice Receive Amortization from a Base/Torch/Creation payment
     ///         or another Amortization transfer
     /// @dev New amount is simply added to the decayed balance.
     ///      No batch tracking. No birthday stamps.
@@ -234,6 +235,9 @@ contract AmortizationWallet {
 //
 // When spent, Base transforms into Amortization — the currency changes nature
 // at the moment of exchange. Like water becoming steam at 100°C.
+//
+// When converted to Torch, the cap permanently decreases. The USDT backing
+// flows to the infrastructure fund. This is the entry to the economy of love.
 
 contract BaseWallet {
     using DecayMath for *;
@@ -242,13 +246,15 @@ contract BaseWallet {
 
     struct Wallet {
         uint256 balance;         // Current Base balance (WAD)
-        uint256 cap;             // Personal cap (= total USDT deposited, max 1,000)
+        uint256 cap;             // Personal cap (= total USDT deposited - cumulative conversions, max 1,000)
         uint256 lastUpdateTime;  // Timestamp of last recovery calculation
     }
 
     mapping(address => Wallet) public wallets;
 
     AmortizationWallet public amortizationWallet;
+    TorchWallet public torchWallet;
+    IgnitionPool public igp;
     StablecoinPool public scp;
 
     // IERC20 public usdt;  // USDT/USDC token contract
@@ -257,6 +263,7 @@ contract BaseWallet {
     event Deposited(address indexed user, uint256 baseAmount, uint256 scpAmount);
     event Paid(address indexed from, address indexed to, uint256 amount);
     event Recovered(address indexed user, uint256 oldBalance, uint256 newBalance);
+    event Converted(address indexed user, uint256 amount, uint256 newCap);
 
     /// @notice Get current balance after applying recovery (per-second precision)
     /// @dev Recovery follows: newBal = cap - (cap - bal) × 0.94^(seconds/86400)
@@ -288,6 +295,7 @@ contract BaseWallet {
     /// @dev The wallet cap is an absolute ceiling, not a monthly limit.
     ///      If cap is already at MAX_CAP, all USDT goes to SCP.
     ///      Recovery is handled by the exponential function, not by periodic refills.
+    ///      If cap was previously reduced by Torch conversion, deposit restores it.
     function deposit(uint256 usdtAmount) external {
         Wallet storage w = wallets[msg.sender];
 
@@ -338,6 +346,54 @@ contract BaseWallet {
         emit Paid(msg.sender, to, amount);
     }
 
+    /// @notice Convert Base to Torch — entering the economy of love
+    /// @dev This is a personal commitment to the AMI economy.
+    ///      - Base cap permanently decreases by the converted amount
+    ///      - USDT flows from SCP to infrastructure fund
+    ///      - Torch is created in the converter's Torch wallet (up to 1,000)
+    ///      - IGP equal to 3× the converted amount is created
+    ///      - If SCP has excess USDT, SCP is drawn first to preserve Base balance
+    ///
+    ///      "The first ignition is the author's own. 1,000 USDT to Torch.
+    ///       Base cap permanently zero. All existence guarantee released.
+    ///       Proof of Return begins with one person's return."
+    function convert(uint256 amount) external {
+        Wallet storage w = wallets[msg.sender];
+        uint256 currentBalance = _applyRecovery(msg.sender);
+
+        // Determine where the USDT comes from
+        uint256 userScpExcess = 0;
+        uint256 scpBalance = scp.balanceOf(msg.sender);
+        if (scpBalance > w.cap) {
+            userScpExcess = scpBalance - w.cap;
+        }
+
+        if (amount <= userScpExcess) {
+            // SCP excess covers the full amount — Base balance is preserved
+            scp.transferToInfrastructure(msg.sender, amount);
+        } else {
+            // Draw from SCP excess first, remainder from Base
+            uint256 fromBase = amount - userScpExcess;
+            require(currentBalance >= fromBase, "Insufficient balance for conversion");
+
+            if (userScpExcess > 0) {
+                scp.transferToInfrastructure(msg.sender, userScpExcess);
+            }
+            w.balance = currentBalance - fromBase;
+        }
+
+        // Permanently reduce Base cap
+        w.cap -= amount;
+
+        // Create Torch in converter's wallet (capped at 1,000)
+        torchWallet._receiveFromConversion(msg.sender, amount);
+
+        // Create IGP at 3× the converted amount
+        igp._receiveFromConversion(msg.sender, amount);
+
+        emit Converted(msg.sender, amount, w.cap);
+    }
+
     /// @notice Withdraw USDT from SCP
     /// @dev When USDT is withdrawn, the backing for Base is reduced.
     ///      Base cap must decrease proportionally — otherwise Base would
@@ -380,13 +436,195 @@ contract BaseWallet {
 }
 
 // ============================================================================
-// CreationWallet — The fire that does not recover
+// TorchWallet — Pay it forward
 // ============================================================================
 //
-// Three wallets, three natures:
+// Five wallets, five natures:
 //   Base:         does not decay,  recovers         (existence)
+//   Torch:        does not decay,  recovers         (pay-it-forward)
 //   Creation:     does not decay,  does not recover  (a finite fire)
+//   IGP:          does not decay,  does not recover  (propagation fuel)
 //   Amortization: decays,          does not recover  (the return cycle)
+//
+// Torch is the mirror of Base. Same cap (1,000). Same recovery (6%/day).
+// The only difference: Torch has no USDT exit. It exists only inside
+// the AMI economy — the economy of love.
+//
+// The vessel for receiving is equal for everyone.
+// The vessel for giving (IGP) grows without limit.
+
+contract TorchWallet {
+    using DecayMath for *;
+
+    uint256 constant TORCH_CAP = 1000e18; // 1,000 Torch (WAD) — same as Base
+
+    struct Wallet {
+        uint256 balance;         // Current Torch balance (WAD)
+        uint256 lastUpdateTime;  // Timestamp of last recovery calculation
+    }
+
+    mapping(address => Wallet) public wallets;
+
+    AmortizationWallet public amortizationWallet;
+
+    // --- Events ---
+    event ReceivedFromConversion(address indexed user, uint256 amount, uint256 newBalance);
+    event ReceivedFromIgnition(address indexed user, uint256 amount, uint256 newBalance);
+    event Paid(address indexed from, address indexed to, uint256 amount);
+    event Recovered(address indexed user, uint256 oldBalance, uint256 newBalance);
+
+    /// @notice Get current balance after applying recovery
+    /// @dev Same formula as BaseWallet. Same breath.
+    ///      newBal = cap - (cap - bal) × 0.94^(seconds/86400)
+    function getBalance(address owner) public view returns (uint256) {
+        Wallet storage w = wallets[owner];
+        if (w.balance == 0 && w.lastUpdateTime == 0) return 0;
+
+        uint256 elapsed = block.timestamp - w.lastUpdateTime;
+        return DecayMath.recoverBalance(w.balance, TORCH_CAP, elapsed);
+    }
+
+    /// @notice Apply recovery and update stored state
+    function _applyRecovery(address owner) internal returns (uint256 currentBalance) {
+        uint256 oldBalance = wallets[owner].balance;
+        currentBalance = getBalance(owner);
+        wallets[owner].balance = currentBalance;
+        wallets[owner].lastUpdateTime = block.timestamp;
+
+        if (currentBalance > oldBalance) {
+            emit Recovered(owner, oldBalance, currentBalance);
+        }
+    }
+
+    /// @notice Receive Torch from Base conversion
+    /// @dev Called by BaseWallet.convert(). Capped at 1,000.
+    function _receiveFromConversion(address to, uint256 amount) internal {
+        uint256 currentBalance = _applyRecovery(to);
+        uint256 space = TORCH_CAP > currentBalance ? TORCH_CAP - currentBalance : 0;
+        uint256 toAdd = _min(amount, space);
+
+        wallets[to].balance = currentBalance + toAdd;
+
+        emit ReceivedFromConversion(to, toAdd, wallets[to].balance);
+    }
+
+    /// @notice Receive Torch from IGP ignition
+    /// @dev Called by IgnitionPool.ignite(). Capped at 1,000.
+    function _receiveFromIgnition(address to, uint256 amount) internal {
+        uint256 currentBalance = _applyRecovery(to);
+        uint256 space = TORCH_CAP > currentBalance ? TORCH_CAP - currentBalance : 0;
+        uint256 toAdd = _min(amount, space);
+
+        wallets[to].balance = currentBalance + toAdd;
+
+        emit ReceivedFromIgnition(to, toAdd, wallets[to].balance);
+    }
+
+    /// @notice Pay with Torch — the fire enters the return cycle
+    /// @dev Torch → Amortization. Same transformation as Base → Amortization.
+    ///      Torch can be used for ordinary transactions within the AMI economy.
+    ///      There is no bridge back to USDT. The fire stays inside.
+    function pay(address to, uint256 amount) external {
+        uint256 currentBalance = _applyRecovery(msg.sender);
+        require(currentBalance >= amount, "Insufficient Torch balance");
+
+        wallets[msg.sender].balance = currentBalance - amount;
+
+        // === THE TRANSFORMATION ===
+        // Torch → Amortization
+        amortizationWallet._receive(to, amount);
+
+        emit Paid(msg.sender, to, amount);
+    }
+
+    // --- Helpers ---
+
+    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+}
+
+// ============================================================================
+// IgnitionPool (IGP) — Propagation fuel
+// ============================================================================
+//
+// IGP is not a currency. It is the engine of propagation.
+// No decay. No recovery. No cap. No USDT exit.
+// It exists solely to ignite Torch in others.
+//
+// Created at 3× the operation amount — both on conversion and on ignition.
+// The fuel for giving always exceeds what was given.
+// Where Amortization decay converges toward zero,
+// IGP propagation diverges toward the world.
+// One breathes in; the other breathes out.
+
+contract IgnitionPool {
+
+    struct Pool {
+        uint256 balance; // Current IGP balance (WAD)
+    }
+
+    mapping(address => Pool) public pools;
+
+    TorchWallet public torchWallet;
+
+    // --- Events ---
+    event CreatedFromConversion(address indexed user, uint256 igpAmount);
+    event CreatedFromIgnition(address indexed user, uint256 igpAmount);
+    event Ignited(address indexed from, address indexed to, uint256 amount, uint256 torchCreated, uint256 igpCreated);
+
+    /// @notice Receive IGP from Base → Torch conversion (3× multiplier)
+    /// @dev Called by BaseWallet.convert()
+    function _receiveFromConversion(address user, uint256 torchAmount) internal {
+        uint256 igpAmount = torchAmount * 3;
+        pools[user].balance += igpAmount;
+
+        emit CreatedFromConversion(user, igpAmount);
+    }
+
+    /// @notice Receive IGP from ignition receipt (3× multiplier)
+    /// @dev Called by ignite() for the recipient
+    function _receiveFromIgnition(address user, uint256 torchAmount) internal {
+        uint256 igpAmount = torchAmount * 3;
+        pools[user].balance += igpAmount;
+
+        emit CreatedFromIgnition(user, igpAmount);
+    }
+
+    /// @notice Ignite Torch in another person's wallet
+    /// @dev The fire must travel outward — self-ignition is prohibited.
+    ///      - Sender's IGP decreases by the ignited amount
+    ///      - Recipient receives Torch (capped at 1,000)
+    ///      - Recipient receives IGP at 3× the ignited amount (no cap)
+    ///      - No limit on amount or number of recipients
+    ///
+    ///      "The vessel for receiving is equal for everyone.
+    ///       The vessel for giving grows with every act of goodwill."
+    function ignite(address to, uint256 amount) external {
+        require(to != msg.sender, "Cannot ignite own wallet");
+        require(pools[msg.sender].balance >= amount, "Insufficient IGP balance");
+
+        // Deduct from sender's IGP
+        pools[msg.sender].balance -= amount;
+
+        // Create Torch in recipient's wallet (capped at 1,000)
+        torchWallet._receiveFromIgnition(to, amount);
+
+        // Create IGP at 3× in recipient's pool (no cap)
+        _receiveFromIgnition(to, amount);
+
+        emit Ignited(msg.sender, to, amount, amount, amount * 3);
+    }
+
+    /// @notice Get IGP balance (simple read — no decay, no recovery)
+    function getBalance(address owner) public view returns (uint256) {
+        return pools[owner].balance;
+    }
+}
+
+// ============================================================================
+// CreationWallet — The fire that does not recover
+// ============================================================================
 //
 // Creation is granted by the council. It sits in this wallet without decaying
 // — the creator uses it when ready, in whatever amounts they need.
@@ -449,15 +687,21 @@ contract CreationWallet {
 // As the AMI economy grows, new deposits flow in naturally.
 // No yield farming. No lending. Just holding.
 // Future management decided by all participants via DAO vote.
+//
+// Infrastructure fund: USDT from Torch conversions flows here,
+// covering server costs, gas fees, and operational expenses.
+// Usage is fully transparent and disclosed on-chain in real time.
 
 contract StablecoinPool {
 
     mapping(address => uint256) public balanceOf;
     uint256 public totalDeposits;
+    uint256 public infrastructureFund; // USDT from Torch conversions
 
     // --- Events ---
     event Deposited(address indexed user, uint256 amount);
     event Withdrawn(address indexed user, uint256 amount);
+    event InfrastructureFunded(address indexed from, uint256 amount);
 
     /// @notice Deposit USDT into SCP
     function deposit(address user, uint256 amount) external {
@@ -480,6 +724,19 @@ contract StablecoinPool {
         // usdt.transfer(user, amount);
 
         emit Withdrawn(user, amount);
+    }
+
+    /// @notice Transfer USDT from user's SCP to infrastructure fund
+    /// @dev Called by BaseWallet.convert() when Base is converted to Torch.
+    ///      The USDT backing the converted Base funds the system's operations.
+    function transferToInfrastructure(address user, uint256 amount) external {
+        // In production: only callable by BaseWallet contract
+        require(balanceOf[user] >= amount, "Exceeds deposited amount");
+
+        balanceOf[user] -= amount;
+        infrastructureFund += amount;
+
+        emit InfrastructureFunded(user, amount);
     }
 }
 
@@ -524,6 +781,12 @@ contract CreationModule {
     ///      Both evaluate. The memoryless Ami returns after each review.
     ///      This is the council — the ABC recursively embedded within ABC.
     ///
+    ///      Torch history as signal: A participant's cumulative Torch activity
+    ///      — how many fires they have ignited and how far their chains
+    ///      have traveled — is a meaningful signal for the deliberation body.
+    ///      The distance of the journey, not the size of the wallet,
+    ///      speaks to creative intent.
+    ///
     ///      Implementation of the council is beyond this specification.
     ///      The key constraint: spent Creation enters the recipient's
     ///      Amortization wallet and decays at the same rate as everything else.
@@ -543,11 +806,15 @@ contract CreationModule {
 // That's it.
 //
 // One formula: balance × (1 - r)^t
-// Two directions: decay (Amortization → 0) and recovery (Base → cap)
-// Three wallets, three natures:
+// Two directions: decay (Amortization → 0) and recovery (Base/Torch → cap)
+// Five wallets, five natures:
 //   Base:         does not decay,  recovers         (existence)
+//   Torch:        does not decay,  recovers         (pay-it-forward)
 //   Creation:     does not decay,  does not recover  (a finite fire)
+//   IGP:          does not decay,  does not recover  (propagation fuel)
 //   Amortization: decays,          does not recover  (the return cycle)
+//
+// Eight contracts. Four currencies. Two exponentials. One principle.
 //
 // No governance token. No admin key. No committee vote on decay rates.
 // The math breathes. The system returns.
