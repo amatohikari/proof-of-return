@@ -31,6 +31,11 @@ proof-of-return/
 │   ├── SPEC.md                           — 設計仕様書（English）
 │   ├── SPEC_ja.md                        — 設計仕様書（日本語）
 │   └── AMI.sol                           — Solidity擬似コード（8コントラクト）
+├── simulations/                          — インタラクティブ・シミュレーション（v1）
+│   ├── base_currency_simulation.jsx
+│   ├── base_recovery_simulation.jsx
+│   ├── challenge_simulation.jsx
+│   └── decay_comparison.jsx
 └── README.md
 ```
 

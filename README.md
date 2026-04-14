@@ -31,6 +31,11 @@ proof-of-return/
 │   ├── SPEC.md                           — Design specification (English)
 │   ├── SPEC_ja.md                        — Design specification (日本語)
 │   └── AMI.sol                           — Solidity pseudocode (8 contracts)
+├── simulations/                          — Interactive Simulations (v1)
+│   ├── base_currency_simulation.jsx
+│   ├── base_recovery_simulation.jsx
+│   ├── challenge_simulation.jsx
+│   └── decay_comparison.jsx
 └── README.md
 ```
 
